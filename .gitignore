@@ -1,0 +1,10 @@
+state.json
+state.json.*
+*.log
+.migration-*/
+test-results/
+.DS_Store
+Thumbs.db
+Desktop.ini
+.env
+.env.*
