@@ -2,7 +2,7 @@
 
 Windows 环境下的数据目录迁移工具。目标是将 Codex 的工作区、配置目录、运行程序及缓存迁移至另一块本机磁盘，并通过原路径的目录联接保持兼容。
 
-当前阶段：已完成复制与校验引擎，尚未提供原目录切换功能。
+当前阶段：已加入可恢复事务、目录联接切换及保留最新数据的回滚。
 
 ## 环境
 
@@ -34,6 +34,34 @@ powershell.exe -NoProfile -File .\Test-Integration.ps1
 复制使用 Robocopy 的数据 / 属性 / 时间选项，随后单独恢复并核对访问权限，再对文件和附加数据流计算 SHA-256。权限比较保留允许 / 拒绝顺序、身份、访问范围和访问掩码，不把单纯合并重复条目当作权限变化。不会更改源目录权限，也不要求写入 SACL / 所有者权限。
 
 当前自动化支持普通目录和文件，最多 240 字符路径；遇到嵌套目录联接、符号链接、云占位符、EFS 加密、异常权限和占用会停止，不会静默跳过。不保留文件硬链接关系、所有者或审计规则；如有相关依赖，请不要使用此工具。
+
+## 改进阶段
+
+## 事务命令
+
+请把工具放在待迁移目录之外。默认只输出计划，不迁移数据：
+
+```powershell
+powershell.exe -NoProfile -File .\Invoke-Migration.ps1 -Mode Plan -Component Home -DestinationRoot D:\CodexData
+```
+
+先自行创建目标父目录，完全关闭 Codex 及相关辅助进程，再将 `Plan` 改成 `Migrate`。每次迁移一个组件。其他组件为 `Workspace`、`LocalRuntime`、`AppData`、`RuntimeCache`。这些是可覆盖的已知目录约定，不能代表所有 Codex 安装版本；不匹配时使用 `Custom` 并明确指定路径。
+
+```powershell
+powershell.exe -NoProfile -File .\Invoke-Migration.ps1 -Mode Migrate -Component Home -DestinationRoot D:\CodexData
+powershell.exe -NoProfile -File .\Invoke-Migration.ps1 -Mode Status -Component Home -DestinationRoot D:\CodexData
+powershell.exe -NoProfile -File .\Invoke-Migration.ps1 -Mode Rollback -Component Home -DestinationRoot D:\CodexData
+```
+
+`Migrate` 会先复制和校验，再把原目录改名保留为备份，在原位置创建指向新目录的联接。`Rollback` 会复制目标目录中的最新内容回原盘，因此需要额外空间，并保留旧备份及目标目录。成功迁移后再次运行相同事务不会再复制。
+
+状态文件放在目标目录的父目录中，包含本机路径及数量，不包含文件正文或认证信息；不要公开上传状态文件。失败后保留所有副本，先查看状态并回滚，不会自动覆盖已有目标目录。
+
+```powershell
+powershell.exe -NoProfile -File .\Test-Transaction.ps1
+```
+
+此测试使用合成目录验证切换、重复运行、迁移后写入的回滚保留，以及重命名后的中断恢复。
 
 ## 改进阶段
 

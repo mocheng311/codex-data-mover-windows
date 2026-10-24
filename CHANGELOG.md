@@ -1,5 +1,14 @@
 # Change log
 
+## 0.3.0
+
+- Journal transaction intent before filesystem changes and save state atomically.
+- Install compatibility junctions only after content and access verification.
+- Recover an interruption between source rename and junction creation.
+- Copy the latest destination data back during rollback; retain both existing copies.
+- Validate journal paths and serialize operations with source mutex and state-file locks.
+- Add explicit Plan, Migrate, Status, Verify and Rollback commands.
+
 ## 0.2.0
 
 - Separate Robocopy data copying from access-rule preservation.
