@@ -13,6 +13,9 @@ $null = New-Item -ItemType Directory -Path (Join-Path $source 'empty')
 $file = Join-Path $source 'example.txt'
 [IO.File]::WriteAllText($file, 'synthetic fixture only')
 Set-Content -LiteralPath $file -Stream 'FixtureStream' -Value 'synthetic stream'
+$readOnlyFile = Join-Path $source 'readonly.txt'
+[IO.File]::WriteAllText($readOnlyFile, 'read-only fixture')
+[IO.File]::SetAttributes($readOnlyFile, ([IO.FileAttributes]::ReadOnly -bor [IO.FileAttributes]::Hidden))
 function Assert-Rejected([scriptblock]$Action) {
     $rejected = $false
     try { & $Action | Out-Null } catch { $rejected = $true }
@@ -29,11 +32,34 @@ try {
     $denied = [Security.AccessControl.DirectorySecurity]::new()
     $denied.SetSecurityDescriptorSddlForm("D:(D;;0x1;;;$who)(A;;0x3;;;$who)")
     if ((Get-AccessSignature $denied) -ceq (Get-AccessSignature $merged)) { throw 'A deny rule was ignored.' }
-    $owned = [pscustomobject]@{ Id = 12345; HasExited = $false }
-    $process = [pscustomobject]@{ ProcessId = 12345; ParentProcessId = $PID; Name = 'robocopy.exe'; ExecutablePath = (Join-Path $env:SystemRoot 'System32\robocopy.exe'); CommandLine = $source }
+    $created = [DateTime]::UtcNow
+    $owned = [pscustomobject]@{ Id = 12345; StartUtc = $created }
+    $process = [pscustomobject]@{ ProcessId = 12345; ParentProcessId = $PID; Name = 'robocopy.exe'; ExecutablePath = (Join-Path $env:SystemRoot 'System32\robocopy.exe'); CommandLine = $source; CreationDate=$created }
     if (Test-ProcessBlocks $process $owned @($source)) { throw 'The owned copy is still blocked.' }
     $process.ParentProcessId = $PID + 1
     if (-not (Test-ProcessBlocks $process $owned @($source))) { throw 'An unrelated copy was exempted.' }
+    $process.ParentProcessId = $PID; $process.CreationDate = $created.AddSeconds(1)
+    if (-not (Test-ProcessBlocks $process $owned @($source))) { throw 'A reused process identifier was exempted.' }
+    Write-Host 'Checking the identity of a real, owned Robocopy child...'
+    $copySource = Join-Path $root 'owned-copy-source'; $copyTarget = Join-Path $root 'owned-copy-target'
+    $null = New-Item -ItemType Directory -Path $copySource
+    [IO.File]::WriteAllBytes((Join-Path $copySource 'synthetic.bin'), (New-Object byte[] (2MB)))
+    $start = [Diagnostics.ProcessStartInfo]::new()
+    $start.FileName = Join-Path $env:SystemRoot 'System32\robocopy.exe'
+    $start.Arguments = '"' + $copySource + '" "' + $copyTarget + '" /E /MON:1 /MOT:1 /R:0 /W:0 /NFL /NDL /NJH /NJS /NP'
+    $start.UseShellExecute=$false; $start.CreateNoWindow=$true; $start.RedirectStandardOutput=$true; $start.RedirectStandardError=$true
+    $child = [Diagnostics.Process]::new(); $child.StartInfo=$start
+    try {
+        $null = $child.Start()
+        $identity = [pscustomobject]@{Id=$child.Id;StartUtc=$child.StartTime.ToUniversalTime()}
+        $outputTask=$child.StandardOutput.ReadToEndAsync();$errorTask=$child.StandardError.ReadToEndAsync()
+        $actual = Get-CimInstance Win32_Process -Filter ('ProcessId=' + $child.Id)
+        if ($null -eq $actual -or (Test-ProcessBlocks $actual $identity @($copySource))) { throw 'The real owned copy was not recognized.' }
+        if (-not (Test-ProcessBlocks $actual $null @($copySource))) { throw 'An unowned copy was accepted.' }
+        # Stop only this owned synthetic monitor, never a user application.
+        $child.Kill(); $child.WaitForExit()
+        $null=$outputTask.GetAwaiter().GetResult();$null=$errorTask.GetAwaiter().GetResult()
+    } finally { if(-not $child.HasExited){$child.Kill();$child.WaitForExit()};$child.Dispose() }
     Assert-Rejected { Assert-CopyPair $source $source }
     Write-Host 'Checking path guards and file locks...'
     Assert-Rejected { Assert-CopyPair $source (Join-Path $source 'nested') }

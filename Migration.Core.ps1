@@ -11,6 +11,9 @@ function Assert-Windows {
 function Get-NormalPath([string]$Path) {
     if ([string]::IsNullOrWhiteSpace($Path) -or $Path -notmatch '^[A-Za-z]:[\\/]' -or
         $Path.Substring(2).Contains(':') -or $Path -match '[*?\[\]]') { throw 'Use an absolute local drive path without wildcards or streams.' }
+    foreach ($segment in $Path.Replace('/', '\').Substring(3).TrimEnd('\').Split('\')) {
+        if ($segment -match '[. ]$|^(?i:CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(?:\.|$)') { throw 'Ambiguous or reserved Windows path names are unsupported.' }
+    }
     $full = [IO.Path]::GetFullPath($Path).TrimEnd('\')
     if ($full.Length -le 2) { throw 'A volume root cannot be a migration directory.' }
     return $full
@@ -100,7 +103,7 @@ function Set-PreservedAccess([string]$Source, [string]$Destination) {
     if ((Get-AccessSignature (Get-Acl -LiteralPath $Destination)) -cne $expected) { throw 'Permission preservation failed.' }
 }
 function Get-FileStreams([string]$Path) {
-    return @(Get-Item -LiteralPath $Path -Stream '*' -ErrorAction Stop | ForEach-Object {
+    return @(Get-Item -LiteralPath $Path -Force -Stream '*' -ErrorAction Stop | ForEach-Object {
         [pscustomobject]@{ Name = [string]$_.Stream; Length = [long]$_.Length }
     } | Sort-Object Name)
 }
@@ -113,7 +116,18 @@ function Get-Fingerprint([string]$Path) {
     $stream = $null; $sha = [Security.Cryptography.SHA256]::Create()
     try {
         $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
-        return [Convert]::ToBase64String($sha.ComputeHash($stream))
+        $buffer = New-Object byte[] (4MB)
+        [long]$processed = 0; $timer = [Diagnostics.Stopwatch]::StartNew()
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $null = $sha.TransformBlock($buffer, 0, $read, $buffer, 0); $processed += $read
+            if ($timer.Elapsed.TotalSeconds -ge 15) {
+                Assert-Quiescent
+                Write-Host ('Verifying file data: ' + [Math]::Round($processed / 1MB) + ' MiB processed.')
+                $timer.Restart()
+            }
+        }
+        $null = $sha.TransformFinalBlock($buffer, 0, 0)
+        return [Convert]::ToBase64String($sha.Hash)
     } finally { if ($null -ne $stream) { $stream.Dispose() }; $sha.Dispose() }
 }
 function Get-Tree([string]$Root, [switch]$CheckReadable) {
@@ -121,6 +135,7 @@ function Get-Tree([string]$Root, [switch]$CheckReadable) {
     $entries = [Collections.Generic.Dictionary[string,object]]::new([StringComparer]::OrdinalIgnoreCase)
     $stack = [Collections.Generic.Stack[string]]::new(); $stack.Push($Root)
     [long]$bytes = 0; [long]$files = 0
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     while ($stack.Count) {
         $path = $stack.Pop()
         if ($path.Length -gt 240) { throw 'Paths longer than 240 characters require separate handling.' }
@@ -147,17 +162,20 @@ function Get-Tree([string]$Root, [switch]$CheckReadable) {
         }
         $entries.Add($relative, [pscustomobject]@{
             Directory = [bool]$item.PSIsContainer; WriteTicks = $item.LastWriteTimeUtc.Ticks
+            BasicAttributes = ([int]$item.Attributes -band 0x27)
             Access = (Get-AccessSignature $acl); Streams = $streams
         })
         if ($entries.Count % 100 -eq 0) { Assert-Quiescent }
+        if ($timer.Elapsed.TotalSeconds -ge 15) { Write-Host ('Checking tree: ' + $entries.Count + ' entries.'); $timer.Restart() }
     }
     return [pscustomobject]@{ Entries = $entries; Files = $files; Bytes = $bytes }
 }
 function Test-ProcessBlocks($Process, $Owned, [string[]]$Paths) {
     if ($Process.ProcessId -eq $PID) { return $false }
-    if ($null -ne $Owned -and -not $Owned.HasExited -and $Process.ProcessId -eq $Owned.Id -and
+    if ($null -ne $Owned -and $Process.ProcessId -eq $Owned.Id -and
         $Process.ParentProcessId -eq $PID -and $Process.Name -ieq 'robocopy.exe' -and
-        [string]::Equals([string]$Process.ExecutablePath, (Join-Path $env:SystemRoot 'System32\robocopy.exe'), [StringComparison]::OrdinalIgnoreCase)) { return $false }
+        [string]::Equals([string]$Process.ExecutablePath, (Join-Path $env:SystemRoot 'System32\robocopy.exe'), [StringComparison]::OrdinalIgnoreCase) -and
+        [Math]::Abs(($Process.CreationDate.ToUniversalTime() - $Owned.StartUtc).TotalMilliseconds) -lt 10) { return $false }
     if ($Process.Name -match '^(Codex|ChatGPT|cc-switch|codex-windows-sandbox-service)\.exe$') { return $true }
     foreach ($path in $Paths) {
         if ($Process.ExecutablePath -and (Test-Inside ([string]$Process.ExecutablePath) $path)) { return $true }
@@ -182,7 +200,7 @@ function Assert-CopyPair([string]$Source, [string]$Destination) {
     if ((Test-Inside $sourcePath $destinationPath) -or (Test-Inside $destinationPath $sourcePath)) { throw 'Source and destination overlap.' }
     Assert-LocalNtfs $sourcePath; Assert-LocalNtfs $destinationPath
     Assert-PlainChain $sourcePath; Assert-PlainChain $destinationPath
-    Assert-NotSynced $destinationPath
+    Assert-NotSynced $sourcePath; Assert-NotSynced $destinationPath
     if (-not [IO.Directory]::Exists($sourcePath)) { throw 'Source directory is missing.' }
     if (Test-Path -LiteralPath $destinationPath) { throw 'Destination already exists. Never merge into an unknown directory.' }
     if (-not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($destinationPath))) { throw 'Create the destination parent directory first.' }
@@ -195,10 +213,15 @@ function Invoke-DataCopy([string]$Source, [string]$Destination) {
     $psi.RedirectStandardOutput = $true; $psi.RedirectStandardError = $true
     $process = [Diagnostics.Process]::new(); $process.StartInfo = $psi
     $started = $false
+    $timer = [Diagnostics.Stopwatch]::StartNew()
     try {
-        $started = $process.Start(); $script:OwnedCopy = $process
+        $started = $process.Start()
+        $script:OwnedCopy = [pscustomobject]@{Id=$process.Id;StartUtc=$process.StartTime.ToUniversalTime()}
         $output = $process.StandardOutput.ReadToEndAsync(); $errors = $process.StandardError.ReadToEndAsync()
-        do { Assert-Quiescent } while (-not $process.WaitForExit(1000))
+        do {
+            Assert-Quiescent
+            if ($timer.Elapsed.TotalSeconds -ge 15) { Write-Host 'Robocopy is still running; content verification follows.'; $timer.Restart() }
+        } while (-not $process.WaitForExit(1000))
         $null = $output.GetAwaiter().GetResult(); $null = $errors.GetAwaiter().GetResult()
         $script:LastCopyExitCode = $process.ExitCode
         if ($process.ExitCode -ge 8) { throw ('Robocopy failed (exit ' + $process.ExitCode + '). Originals remain intact.') }
@@ -213,7 +236,7 @@ function Assert-TreesEqual([string]$Source, [string]$Destination) {
     foreach ($name in $before.Entries.Keys) {
         if (-not $after.Entries.ContainsKey($name)) { throw 'A destination entry is missing.' }
         $a = $before.Entries[$name]; $b = $after.Entries[$name]
-        if ($a.Directory -ne $b.Directory -or $a.Access -cne $b.Access) { throw 'Entry type or permissions differ.' }
+        if ($a.Directory -ne $b.Directory -or $a.Access -cne $b.Access -or $a.BasicAttributes -ne $b.BasicAttributes) { throw 'Entry type, basic attributes or permissions differ.' }
         if (-not $a.Directory) {
             if ($a.WriteTicks -ne $b.WriteTicks -or ($a.Streams | ConvertTo-Json -Compress) -cne ($b.Streams | ConvertTo-Json -Compress)) { throw 'File timestamp or streams differ.' }
             foreach ($stream in $a.Streams) {
@@ -247,6 +270,9 @@ function Copy-VerifiedTree([string]$Source, [string]$Destination) {
         $sourceItem = if ($name) { Join-Path $Source $name } else { $Source }
         $destinationItem = if ($name) { Join-Path $Destination $name } else { $Destination }
         Set-PreservedAccess $sourceItem $destinationItem
+        $attributes = [int][IO.File]::GetAttributes($destinationItem)
+        $attributes = ($attributes -band (-bnot 0x27)) -bor $current.Entries[$name].BasicAttributes
+        [IO.File]::SetAttributes($destinationItem, [IO.FileAttributes]$attributes)
     }
     Write-Verbose 'Verifying data, streams and permissions.'
     return Assert-TreesEqual $Source $Destination

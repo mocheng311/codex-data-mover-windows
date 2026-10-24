@@ -1,5 +1,9 @@
 state.json
 state.json.*
+*.migration-state.json
+*.migration-state.json.*
+*.lock
+*.tmp-*
 *.log
 .migration-*/
 test-results/

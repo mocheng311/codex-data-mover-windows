@@ -13,6 +13,7 @@ function Assert-DataScope([string]$Source, [string]$Destination) {
 }
 function Assert-ControlPath([string]$StatePath, [string]$Source, [string]$Destination) {
     $state = Get-NormalPath $StatePath
+    Assert-LocalNtfs $state; Assert-NotSynced $state
     Assert-PlainChain ([IO.Path]::GetDirectoryName($state))
     foreach ($root in @($Source, $Destination)) {
         if ((Test-Inside $state $root) -or (Test-Inside $root $state)) { throw 'The state file must be outside both data trees.' }
@@ -128,7 +129,11 @@ function Invoke-Rollback([string]$Source, [string]$Destination, [string]$StatePa
         Assert-Quiescent
         $sourceItem = Get-Item -LiteralPath $Source -Force -ErrorAction SilentlyContinue
         if ($null -ne $sourceItem -and -not ($sourceItem.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
-            if ($journal.Phase -notin @('RolledBack', 'Aborted', 'Copying', 'CopyVerified', 'Failed', 'Switching')) { throw 'An unexpected plain directory occupies the source. No data was overwritten.' }
+            if ($journal.Phase -eq 'InstallingRestore') {
+                if (-not $journal.RestorePath -or (Test-Path -LiteralPath $journal.RestorePath)) { throw 'Restore staging is ambiguous. Nothing was overwritten.' }
+                # The restore rename completed, but its final journal update was interrupted.
+                $null = Assert-TreesEqual $Destination $Source
+            } elseif ($journal.Phase -notin @('RolledBack', 'Aborted', 'Copying', 'CopyVerified', 'Failed', 'Switching')) { throw 'An unexpected plain directory occupies the source. No data was overwritten.' }
             Assert-PlainChain $Source
             $journal.Phase = if ([IO.Directory]::Exists($journal.Backup)) { 'RolledBack' } else { 'Aborted' }
             Save-Journal $journal $StatePath
@@ -137,7 +142,7 @@ function Invoke-Rollback([string]$Source, [string]$Destination, [string]$StatePa
         }
         Assert-PlainChain $journal.Backup
         if (-not [IO.Directory]::Exists($journal.Backup)) { throw 'The recorded original backup is missing. Nothing was changed.' }
-        if ($null -eq $sourceItem -and -not $journal.RestorePath) {
+        if ($null -eq $sourceItem -and -not $journal.RestorePath -and $journal.Phase -eq 'Switching') {
             # An interruption happened between source rename and junction creation.
             [IO.Directory]::Move($journal.Backup, $Source)
             $journal.Phase = 'RolledBack'; Save-Journal $journal $StatePath
@@ -161,4 +166,24 @@ function Invoke-Rollback([string]$Source, [string]$Destination, [string]$StatePa
         Write-Host 'ROLLBACK COMPLETE. Latest data restored; original backup and destination retained.'
         return $journal
     }
+}
+function Wait-ForQuiescence([int]$TimeoutSeconds, [int]$QuietSeconds) {
+    $elapsed = [Diagnostics.Stopwatch]::StartNew(); $quiet = [Diagnostics.Stopwatch]::StartNew()
+    $previous = ''; $heartbeat = [Diagnostics.Stopwatch]::StartNew()
+    Write-Host 'Waiting for applications and helpers to close. Keep this migration window open.'
+    while ($elapsed.Elapsed.TotalSeconds -lt $TimeoutSeconds) {
+        $blockers = @(Get-BlockingProcesses)
+        if ($blockers.Count) {
+            $quiet.Restart()
+            $summary = ($blockers | ForEach-Object { $_.Name + ' (PID ' + $_.PID + ', parent ' + $_.ParentPID + ')' }) -join ', '
+        } else {
+            if ($quiet.Elapsed.TotalSeconds -ge $QuietSeconds) { return }
+            $summary = 'No blockers. Waiting for the quiet period.'
+        }
+        if ($summary -ne $previous -or $heartbeat.Elapsed.TotalSeconds -ge 10) {
+            Write-Host $summary; $previous = $summary; $heartbeat.Restart()
+        }
+        Start-Sleep -Seconds 1
+    }
+    throw 'Timed out waiting for a quiet session. No migration was started.'
 }
